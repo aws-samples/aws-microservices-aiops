@@ -1,0 +1,290 @@
+
+# -------------------------------------------------------------------------------------------------------------------------------------------------------
+#  Integrates DevOps Guru and Config monitoring with AWS Systems Manager Incident Manager
+#
+#  Creates an SSM Response Plan and starts an incident (including creating SSM OpsItems) 
+#  for a DevOps Guru Insight or a Config compliance violation
+#
+#
+# @kmmahaj
+# -------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Parameters:
+  
+  IncidentPlanContactDetailsArn:
+    Type: String
+    Description: Arn of the Contact details for the Incident Plan
+    Default: 'arn:aws:ssm-contacts:region:account:contact/sec-team-responder'
+
+Resources:
+
+# ------------------------------------------------------------------------------------------------------------
+# Create an AWS Systems Manager Incident Manager response plan
+# ------------------------------------------------------------------------------------------------------------
+
+  AWSIncidentManagerResponsePlanDevOpsGuru:
+    Type: AWS::SSMIncidents::ResponsePlan
+    Properties: 
+      DisplayName: String
+      Engagements: 
+         - !Ref IncidentPlanContactDetailsArn
+      IncidentTemplate: 
+        Impact: 3
+        Title: 'DevOps Incident'
+      Name: 'DevOpsGuru-ResponsePlan'
+  
+
+  AWSIncidentManagerResponsePlanConfig:
+    Type: AWS::SSMIncidents::ResponsePlan
+    Properties: 
+      Actions: 
+        - SsmAutomation:
+            DocumentName: 'AWSIncidents-CriticalIncidentRunbookTemplate'
+            DocumentVersion: "$DEFAULT"
+            RoleArn: !GetAtt IncidentManagerSSMRole.Arn
+            TargetAccount: 'IMPACTED_ACCOUNT'
+      DisplayName: String
+      Engagements: 
+         - !Ref IncidentPlanContactDetailsArn
+      IncidentTemplate: 
+        Impact: 3
+        Title: 'DevOps Incident'
+      Name: 'Config-ResponsePlan'
+  
+  IncidentManagerSSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyName: IncidentManagerSSMPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - ssm-incidents:StartIncident
+            - ssm-incidents:ListResponsePlans
+            - ssm-incidents:GetResponsePlan
+            - ssm-incidents:ListIncidentRecords
+            - ssm-incidents:GetIncidentRecord
+            Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal: { Service: ssm.amazonaws.com }
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSIncidentManagerResolverAccess'
+
+# ------------------------------------------------------------------------------------------------------------
+# Create an SSM Incident based on DevOps Guru insights
+# ------------------------------------------------------------------------------------------------------------
+
+  DevOpsGuruInsightsRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Name: DevOpsGuruInsightsRule
+      Description: "Insights Rule that triggers an SSM Incident"
+      EventPattern: 
+        source: 
+          - aws.devops-guru
+        detail-type: 
+          - DevOps Guru New Insight Open
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "DevOpsGuruInsightsLambda"
+              - "Arn"
+          Id: "InsightsIncident"
+ 
+  ConfigComplianceIncidentRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Name: ConfigComplianceIncidentRule
+      Description: "Compliance violation that triggers an SSM Incident"
+      EventPattern: 
+        source: 
+          - aws.config
+        detail-type: 
+          - Config Rules Compliance Change
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "ConfigComplianceIncidentLambda"
+              - "Arn"
+          Id: "ComplianceIncident"
+
+  ConfigComplianceIncidentLambdaPermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "ConfigComplianceIncidentLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ConfigComplianceIncidentRule"
+          - "Arn"
+
+  DevOpsGuruInsightsLambdaPermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "DevOpsGuruInsightsLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "DevOpsGuruInsightsRule"
+          - "Arn"
+
+  DevOpsGuruInsightsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DevOpsGuruInsightsLambda
+      Description: Lambda function that starts an incident
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt  IncidentLambdaRole.Arn
+      Runtime: python3.7
+      Environment:
+        Variables:
+          DevOpsGuruIncidentResponsePlanArn: !Ref AWSIncidentManagerResponsePlanDevOpsGuru
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import datetime
+          def lambda_handler(event, context):
+            
+              DevOpsGuruIncidentResponsePlanArn = os.environ['DevOpsGuruIncidentResponsePlanArn']
+              #Get Event details
+              eventDetails = event['detail']
+              insightType = str(eventDetails['insightType'])
+              insightUrl = str(eventDetails['insightUrl'])
+              
+              # ISO Time
+              iso8061Time = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+              client = boto3.client('ssm-incidents')
+              try:
+                  response_startincident = client.start_incident(
+                      responsePlanArn=DevOpsGuruIncidentResponsePlanArn,
+                      relatedItems=[
+                          {
+                            'identifier': {
+                                  'type': insightType,
+                                  'value': {
+                                     'url': insightUrl,
+                                  }
+                              },
+                            'title': 'DevOpsGuruInsights Incident'
+                          }
+                      ],
+                      triggerDetails={
+                          'source': 'microservices-devops-guru'
+                          'timestamp' : iso8061Time
+                      }
+                  )
+              except Exception as e:
+                  print(e)
+                  print("SSM automation execution error")
+                  raise
+
+  IncidentLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyName: IncidentLambdaPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - ssm-incidents:StartIncident
+            - ssm-incidents:ListResponsePlans
+            - ssm-incidents:GetResponsePlan
+            - ssm-incidents:ListIncidentRecords
+            - ssm-incidents:GetIncidentRecord
+            Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSIncidentManagerResolverAccess'
+
+  ConfigComplianceIncidentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ConfigComplianceIncidentLambda
+      Description: Lambda function that starts an incident
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt  IncidentLambdaRole.Arn
+      Runtime: python3.7
+      Environment:
+        Variables:
+          ConfigIncidentResponsePlanArn: !Ref AWSIncidentManagerResponsePlanConfig
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import datetime
+          def lambda_handler(event, context):
+            
+              ConfigIncidentResponsePlanArn = os.environ['ConfigIncidentResponsePlanArn']
+              #Get Event details
+              eventDetails = event['detail']
+              insightType = str(eventDetails['insightType'])
+              insightUrl = str(eventDetails['insightUrl'])
+              
+              # ISO Time
+              iso8061Time = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+              client = boto3.client('ssm-incidents')
+              try:
+                  response_startincident = client.start_incident(
+                      responsePlanArn=ConfigIncidentResponsePlanArn,
+                      relatedItems=[
+                          {
+                            'identifier': {
+                                  'type': insightType,
+                                  'value': {
+                                     'url': insightUrl,
+                                  }
+                              },
+                            'title': 'Config Non Compliance Incident'
+                          }
+                      ],
+                      triggerDetails={
+                          'source': 'microservices-config-rule'
+                          'timestamp' : iso8061Time
+                      }
+                  )
+              except Exception as e:
+                  print(e)
+                  print("SSM automation execution error")
+                  raise
